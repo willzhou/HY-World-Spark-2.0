@@ -631,12 +631,12 @@ def gradio_demo(
 def refresh_3d_scene(workspace, frame_sel, show_cam, is_example,
                      filter_sky, show_mesh, filter_amb):
     if is_example == "True":
-        return gr.update(), gr.update(), "Click Reconstruct first."
+        return gr.update(), gr.update(), "Click Reconstruct first.", gr.update()
     if not workspace or workspace == "None" or not os.path.isdir(workspace):
-        return gr.update(), gr.update(), "No results. Please reconstruct first."
+        return gr.update(), gr.update(), "No results. Please reconstruct first.", gr.update()
     pred_file = os.path.join(workspace, "predictions.npz")
     if not os.path.exists(pred_file):
-        return gr.update(), gr.update(), "Missing predictions. Reconstruct first."
+        return gr.update(), gr.update(), "Missing predictions. Reconstruct first.", gr.update()
 
     data = np.load(pred_file, allow_pickle=True)
     preds = {k: data[k] for k in data.keys()}
@@ -652,7 +652,8 @@ def refresh_3d_scene(workspace, frame_sel, show_cam, is_example,
         scene.export(file_obj=glb_path)
 
     gs_path = os.path.join(workspace, "gaussians.ply")
-    return glb_path, gs_path if os.path.exists(gs_path) else None, "3D scene updated."
+    gs_url = f"/file={gs_path}" if os.path.exists(gs_path) else None
+    return glb_path, gs_path if os.path.exists(gs_path) else None, "3D scene updated.", gs_url
 
 
 def refresh_views_on_filter(workspace, sky_filter, pd, d_slider, n_slider):
@@ -758,6 +759,30 @@ def _nav_normal(pd, target):
     return update_normal_view(pd, idx), update_view_info(idx + 1, n, "Normal")
 
 
+def _get_splat_url(output_dir, gs_file):
+    """Build Gradio file URL for the PLY splat file.
+
+    gs_file comes from invisible Model3D (gr.FileData object) or is a string path.
+    """
+    if gs_file is None:
+        return None
+    # Handle Gradio FileData object (from Model3D invisible component)
+    if hasattr(gs_file, 'path'):
+        file_path = gs_file.path
+    elif isinstance(gs_file, str):
+        file_path = gs_file
+    else:
+        return None
+    if not file_path or not os.path.isfile(file_path):
+        return None
+    return f"/file={file_path}"
+
+
+def _clear_spark():
+    """Reset the Spark HTML overlay."""
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
@@ -794,6 +819,7 @@ def build_demo(examples_dir="./examples/worldrecon"):
     with gr.Blocks(theme=theme, css=css) as demo:
         is_example = gr.Textbox(visible=False, value="None")
         processed_data_state = gr.State(value=None)
+        gs_ply_state = gr.State(value=None)
 
         gr.HTML("""
         <div style="text-align:center;">
@@ -842,7 +868,156 @@ def build_demo(examples_dir="./examples/worldrecon"):
 
                 with gr.Tabs():
                     with gr.Tab("3D Gaussian Splatting", id=1):
-                        gs_output = gr.Model3D(label="Gaussian Splatting", height=500)
+                        # Hidden dummy Model3D to capture gs_file path for JS interop
+                        gs_output = gr.Model3D(visible=False, height=1)
+                        spark_viewer_html = gr.HTML(f"""
+                        <div id="spark-container" style="position:relative; width:100%; height:500px;
+                             background:#111; border-radius:8px; overflow:hidden; margin:0;">
+                          <canvas id="spark-canvas" style="display:block; width:100%; height:100%;"></canvas>
+                          <div id="spark-overlay" style="position:absolute; top:0; left:0; right:0; bottom:0;
+                               display:flex; align-items:center; justify-content:center; flex-direction:column;
+                               background:#1a1a1a; color:#888; font-family:monospace; font-size:14px;">
+                            <div style="font-size:18px; margin-bottom:8px;">📡</div>
+                            <div>Click "Reconstruct" to generate 3DGS</div>
+                          </div>
+                          <div id="spark-controls" style="position:absolute; bottom:12px; left:12px; right:12px;
+                               display:none; justify-content:space-between; align-items:center; color:#ccc;
+                               font-family:monospace; font-size:12px;">
+                            <div id="spark-info"></div>
+                            <div style="display:flex; gap:8px;">
+                              <button onclick="sparkReset()" style="background:#333; color:#fff; border:1px solid #555;
+                                   padding:4px 10px; border-radius:4px; cursor:pointer;">Reset</button>
+                              <button onclick="sparkToggleSpin()" id="spin-btn"
+                                   style="background:#333; color:#fff; border:1px solid #555;
+                                   padding:4px 10px; border-radius:4px; cursor:pointer;">Auto Spin</button>
+                            </div>
+                          </div>
+                        </div>
+                        <script type="importmap">
+                        {{
+                          "imports": {{
+                            "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/r180/three.module.js",
+                            "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/2.0.0/spark.module.js"
+                          }}
+                        }}
+                        </script>
+                        <script type="module">
+                        import * as THREE from "three";
+                        import {{ SparkRenderer, SplatMesh }} from "@sparkjsdev/spark";
+
+                        let sparkRenderer, splatMesh, animFrame;
+                        let autoSpin = false;
+                        let initialized = false;
+
+                        const canvas = document.getElementById('spark-canvas');
+                        const overlay = document.getElementById('spark-overlay');
+                        const controls = document.getElementById('spark-controls');
+                        const info = document.getElementById('spark-info');
+
+                        function initSpark() {{
+                          if (sparkRenderer) return;
+                          const renderer = new THREE.WebGLRenderer({{
+                            canvas,
+                            antialias: false,
+                            powerPreference: "high-performance",
+                          }});
+                          renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+                          renderer.setClearColor(0x000000, 1);
+
+                          const scene = new THREE.Scene();
+                          const camera = new THREE.PerspectiveCamera(60, canvas.clientWidth / canvas.clientHeight, 0.01, 1000);
+
+                          sparkRenderer = new SparkRenderer({{ renderer }});
+                          scene.add(sparkRenderer);
+
+                          // Simple orbit controls via mouse drag
+                          let isDragging = false, prevX = 0, prevY = 0;
+                          let yaw = 0, pitch = 0;
+                          let targetYaw = 0, targetPitch = 0;
+
+                          canvas.addEventListener('mousedown', e => {{ isDragging = true; prevX = e.clientX; prevY = e.clientY; }});
+                          window.addEventListener('mouseup', () => {{ isDragging = false; }});
+                          window.addEventListener('mousemove', e => {{
+                            if (!isDragging) return;
+                            const dx = e.clientX - prevX, dy = e.clientY - prevY;
+                            targetYaw -= dx * 0.005;
+                            targetPitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, targetPitch - dy * 0.005));
+                            prevX = e.clientX; prevY = e.clientY;
+                          }});
+
+                          // Touch support
+                          canvas.addEventListener('touchstart', e => {{ isDragging = true; prevX = e.touches[0].clientX; prevY = e.touches[0].clientY; }});
+                          window.addEventListener('touchend', () => {{ isDragging = false; }});
+                          window.addEventListener('touchmove', e => {{
+                            if (!isDragging) return;
+                            const dx = e.touches[0].clientX - prevX, dy = e.touches[0].clientY - prevY;
+                            targetYaw -= dx * 0.005;
+                            targetPitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, targetPitch - dy * 0.005));
+                            prevX = e.touches[0].clientX; prevY = e.touches[0].clientY;
+                          }});
+
+                          window.addEventListener('resize', () => {{
+                            if (!canvas.clientWidth || !canvas.clientHeight) return;
+                            renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+                            camera.aspect = canvas.clientWidth / canvas.clientHeight;
+                            camera.updateProjectionMatrix();
+                          }});
+
+                          function animate() {{
+                            animFrame = requestAnimationFrame(animate);
+                            if (autoSpin && splatMesh) targetYaw += 0.005;
+                            yaw += (targetYaw - yaw) * 0.1;
+                            pitch += (targetPitch - pitch) * 0.1;
+                            camera.position.set(
+                              Math.cos(pitch) * Math.sin(yaw) * 3,
+                              Math.sin(pitch) * 3,
+                              Math.cos(pitch) * Math.cos(yaw) * 3
+                            );
+                            camera.lookAt(0, 0, 0);
+                            renderer.render(scene, camera);
+                          }}
+                          animate();
+                          initialized = true;
+                        }}
+
+                        initSpark();
+
+                        window.loadSplatFile = async function(url) {{
+                          if (!initialized) initSpark();
+                          if (splatMesh) {{
+                            sparkRenderer.remove(splatMesh);
+                            splatMesh.dispose();
+                            splatMesh = null;
+                          }}
+                          overlay.innerHTML = '<div style="color:#888; font-family:monospace;">Loading splat file...</div>';
+                          try {{
+                            splatMesh = new SplatMesh({{ url }});
+                            splatMesh.quaternion.set(1, 0, 0, 0);
+                            sparkRenderer.add(splatMesh);
+                            await splatMesh.initialized;
+                            overlay.style.display = 'none';
+                            controls.style.display = 'flex';
+                            const n = splatMesh.packedSplats ? splatMesh.packedSplats.numSplats : '?';
+                            info.textContent = typeof n === 'number' ? `${{n.toLocaleString()}} splats` : 'splats loaded';
+                          }} catch (e) {{
+                            overlay.innerHTML = `<div style="color:#f55;">Load failed: ${{e.message || e}}</div>`;
+                          }}
+                        }};
+
+                        window.sparkReset = function() {{
+                          targetYaw = 0; targetPitch = 0;
+                          autoSpin = false;
+                          document.getElementById('spin-btn').textContent = 'Auto Spin';
+                        }};
+
+                        window.sparkToggleSpin = function() {{
+                          autoSpin = !autoSpin;
+                          document.getElementById('spin-btn').textContent = autoSpin ? 'Stop Spin' : 'Auto Spin';
+                        }};
+
+                        window.getSparkCanvas = () => canvas;
+                        </script>
+                        """)
 
                     with gr.Tab("Point Cloud / Mesh", id=0):
                         reconstruction_output = gr.Model3D(label="3D Pointmap / Mesh", height=500,
@@ -873,7 +1048,7 @@ def build_demo(examples_dir="./examples/worldrecon"):
                         file_upload, reconstruction_output, log_output, output_path_state,
                         image_gallery, depth_map, normal_map, depth_view_slider,
                         normal_view_slider, depth_view_info, normal_view_info,
-                        camera_params_btn, gs_output,
+                        camera_params_btn, gs_output, gs_ply_state,
                     ], scale=1)
 
                 with gr.Row():
@@ -939,14 +1114,26 @@ def build_demo(examples_dir="./examples/worldrecon"):
             [reconstruction_output, log_output, frame_selector, processed_data_state,
              depth_map, normal_map, depth_view_slider, normal_view_slider,
              depth_view_info, normal_view_info, camera_params_btn, gs_output, terminal_output],
+        ).then(
+            _get_splat_url, [output_path_state, gs_output], [gs_ply_state],
+        ).then(
+            lambda url: url,
+            [gs_ply_state],
+            [],
+            js="(url) => { if (url && window.loadSplatFile) { try { window.loadSplatFile(url); } catch(e) { console.error(e); } } }",
         ).then(lambda: "False", [], [is_example])
 
         # ---- Events: Refresh 3D scene on option change ----
         _scene_inputs = [output_path_state, frame_selector, show_camera, is_example,
                          filter_sky_bg, show_mesh, filter_ambiguous]
-        _scene_outputs = [reconstruction_output, gs_output, log_output]
+        _scene_outputs = [reconstruction_output, gs_output, log_output, gs_ply_state]
         for ctrl in (frame_selector, show_camera, show_mesh):
-            ctrl.change(refresh_3d_scene, _scene_inputs, _scene_outputs)
+            ctrl.change(refresh_3d_scene, _scene_inputs, _scene_outputs).then(
+                lambda url: url,
+                [gs_ply_state],
+                [],
+                js="(url) => { if (url && window.loadSplatFile) { try { window.loadSplatFile(url); } catch(e) { console.error(e); } } }",
+            )
 
         _filter_inputs = [output_path_state, filter_sky_bg, processed_data_state,
                           depth_view_slider, normal_view_slider]
@@ -954,6 +1141,11 @@ def build_demo(examples_dir="./examples/worldrecon"):
 
         for ctrl in (filter_sky_bg, filter_ambiguous):
             ctrl.change(refresh_3d_scene, _scene_inputs, _scene_outputs).then(
+                lambda url: url,
+                [gs_ply_state],
+                [],
+                js="(url) => { if (url && window.loadSplatFile) { try { window.loadSplatFile(url); } catch(e) { console.error(e); } } }",
+            ).then(
                 refresh_views_on_filter, _filter_inputs, _filter_outputs)
 
         # ---- Events: File upload ----
