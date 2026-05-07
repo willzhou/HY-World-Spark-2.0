@@ -375,14 +375,7 @@ class VisualGeometryTransformer(nn.Module):
                                 padding_tokens = tk_padding_len
                             )
                     global_tokens = global_tokens.reshape(b,-1,embed_dim)
-                    # DEBUG
-                    print(f"[DEBUG VGT ALLGATHER dim=1] rank={dist.get_rank()}, rank_in_sp={rank_in_sp_group}, "
-                          f"global_tokens.shape={global_tokens.shape}, tk_padding_len={tk_padding_len}, seq_len={seq_len}, block_idx={idx}")
-                    dist.barrier()
                     global_tokens = _Allgather.apply(global_tokens,1,sp_group,False)
-                    print(f"[DEBUG VGT ALLGATHER dim=1] rank={dist.get_rank()}, AFTER ALLGATHER dim=1 SUCCESS, block_idx={idx}")
-                    dist.barrier()
-                    # END DEBUG
                     global_tokens = depad_by_length(global_tokens,tk_padding_len*seq_len,1)
                     global_tokens = global_tokens.reshape(b,seq_len,-1,embed_dim)
                     global_tokens = pad_by_length(global_tokens,tk_padding_len,2)
@@ -390,18 +383,9 @@ class VisualGeometryTransformer(nn.Module):
                     
                     # Combine frame and global intermediates
                     if idx in self.intermediate_idxs:
-                        # DEBUG
-                        print(f"[DEBUG VGT ALLGATHER dim=2] rank={dist.get_rank()}, rank_in_sp={rank_in_sp_group}, "
-                              f"local_tokens.shape={local_tokens.shape}, global_tokens.shape={global_tokens.shape}, "
-                              f"tk_padding_len={tk_padding_len}, block_idx={idx}, intermediate_idxs={self.intermediate_idxs}")
-                        dist.barrier()
                         local_tokens = _Allgather.apply(local_tokens,2,sp_group,False)
-                        print(f"[DEBUG VGT ALLGATHER dim=2] rank={dist.get_rank()}, AFTER local_tokens ALLGATHER SUCCESS, block_idx={idx}")
-                        dist.barrier()
                         local_tokens = depad_by_length(local_tokens,tk_padding_len,2)
                         global_tokens = _Allgather.apply(global_tokens,2,sp_group,False)
-                        print(f"[DEBUG VGT ALLGATHER dim=2] rank={dist.get_rank()}, AFTER global_tokens ALLGATHER SUCCESS, block_idx={idx}")
-                        dist.barrier()
                         global_tokens = depad_by_length(global_tokens,tk_padding_len,2)
                         combined_out = torch.cat([local_tokens, global_tokens], dim=-1)
                         outputs.append(combined_out)
@@ -513,30 +497,12 @@ class VisualGeometryTransformer(nn.Module):
         
         if block_type=="global":
             rank_in_sp_group = dist.get_group_rank(sp_group,dist.get_rank())
-            # DEBUG
-            print(f"[DEBUG _process_dist_attn block=global] rank={dist.get_rank()}, rank_in_sp={rank_in_sp_group}, "
-                  f"tokens.shape={tokens.shape}, padding_tokens={padding_tokens}, seq_len={seq_len}, "
-                  f"patch_count={patch_count}, embed_dim={embed_dim}, block_idx={block_idx}")
-            dist.barrier()
             tokens = _Allgather.apply(tokens,2,sp_group,False) #(1,7,4*146,64)
-            print(f"[DEBUG _process_dist_attn block=global] rank={dist.get_rank()}, AFTER allgather dim=2: tokens.shape={tokens.shape}")
-            dist.barrier()
             tokens = depad_by_length(tokens,padding_tokens,2) #(1,7,4*146-2,64)
-            print(f"[DEBUG _process_dist_attn block=global] rank={dist.get_rank()}, AFTER depad: tokens.shape={tokens.shape}")
-            dist.barrier()
             tokens = tokens.reshape(b,-1,embed_dim) #(1,7*(4*146-2),64)
-            print(f"[DEBUG _process_dist_attn block=global] rank={dist.get_rank()}, AFTER reshape: tokens.shape={tokens.shape}")
-            dist.barrier()
-            padding_tokens_orig = padding_tokens
             padding_tokens = padding_tokens*seq_len
             tokens = pad_by_length(tokens,padding_tokens,1) #(1,4088,1024)
-            print(f"[DEBUG _process_dist_attn block=global] rank={dist.get_rank()}, AFTER pad_by_length: tokens.shape={tokens.shape}, "
-                  f"padding_tokens {padding_tokens_orig}*seq_len={seq_len}={padding_tokens}")
-            dist.barrier()
             tokens = torch.chunk(tokens, sp_size,dim=1)[rank_in_sp_group]
-            print(f"[DEBUG _process_dist_attn block=global] rank={dist.get_rank()}, AFTER chunk: tokens.shape={tokens.shape}")
-            dist.barrier()
-            # END DEBUG
             
         if tokens.shape != target_shape:
             tokens = tokens.reshape(*target_shape)
