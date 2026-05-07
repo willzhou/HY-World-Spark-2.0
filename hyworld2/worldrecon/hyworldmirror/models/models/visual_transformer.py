@@ -378,7 +378,7 @@ class VisualGeometryTransformer(nn.Module):
                     global_tokens = _Allgather.apply(global_tokens,1,sp_group,False)
                     global_tokens = depad_by_length(global_tokens,tk_padding_len*seq_len,1)
                     global_tokens = global_tokens.reshape(b,seq_len,-1,embed_dim)
-                    global_tokens, _ = minimal_pad_to_divisible(global_tokens, sp_size, dim=2, pad_value=0)
+                    global_tokens = pad_by_length(global_tokens,tk_padding_len,2)
                     global_tokens = torch.chunk(global_tokens, sp_size,dim=2)[rank_in_sp_group]
                     
                     # Combine frame and global intermediates
@@ -389,7 +389,7 @@ class VisualGeometryTransformer(nn.Module):
                         global_tokens = depad_by_length(global_tokens,tk_padding_len,2)
                         combined_out = torch.cat([local_tokens, global_tokens], dim=-1)
                         outputs.append(combined_out)
-                        global_tokens, _ = minimal_pad_to_divisible(global_tokens, sp_size, dim=2, pad_value=0)
+                        global_tokens = pad_by_length(global_tokens,tk_padding_len,2)
                         global_tokens = torch.chunk(global_tokens, sp_size,dim=2)[rank_in_sp_group]
             else:
                 for idx in range(self.depth):
@@ -501,8 +501,7 @@ class VisualGeometryTransformer(nn.Module):
             tokens = depad_by_length(tokens,padding_tokens,2) #(1,7,4*146-2,64)
             tokens = tokens.reshape(b,-1,embed_dim) #(1,7*(4*146-2),64)
             padding_tokens = padding_tokens*seq_len
-            tokens, extra_pad = minimal_pad_to_divisible(tokens, sp_size, dim=1, pad_value=0)
-            padding_tokens += extra_pad
+            tokens = pad_by_length(tokens,padding_tokens,1) #(1,4088,1024)
             tokens = torch.chunk(tokens, sp_size,dim=1)[rank_in_sp_group]
             
         if tokens.shape != target_shape:
