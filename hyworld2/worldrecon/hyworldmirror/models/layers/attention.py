@@ -98,6 +98,14 @@ class Attention(nn.Module):
 
 class DistAttention(Attention):
     def forward(self, x: Tensor, pos=None, sp_size=1, sp_group=None, padding_tokens=0) -> Tensor:
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        # DEBUG
+        if sp_size > 1:
+            print(f"[DEBUG DistAttention] rank={rank}, x.shape={x.shape}, sp_size={sp_size}, "
+                  f"padding_tokens={padding_tokens}, num_heads={self.num_heads}")
+            dist.barrier()
+        # END DEBUG
 
         q, k, v, B, N, C = self._compute_qkv(x)
 
@@ -106,10 +114,21 @@ class DistAttention(Attention):
             q, head_pad = minimal_pad_to_divisible(q, sp_size, dim=1, pad_value=0)
             k, _       = minimal_pad_to_divisible(k, sp_size, dim=1, pad_value=0)
             v, _       = minimal_pad_to_divisible(v, sp_size, dim=1, pad_value=0)
+            # DEBUG
+            print(f"[DEBUG DistAttention] rank={rank}, AFTER head pad: q.shape={q.shape}, head_pad={head_pad}")
+            dist.barrier()
+            # END DEBUG
 
+            # DEBUG - before all2all
+            print(f"[DEBUG DistAttention] rank={rank}, BEFORE all2all: q.shape={q.shape}, k.shape={k.shape}, v.shape={v.shape}")
+            dist.barrier()
             q = _All2All.apply(q,1,2,sp_group,False)
             k = _All2All.apply(k,1,2,sp_group,False)
             v = _All2All.apply(v,1,2,sp_group,False)
+            # DEBUG
+            print(f"[DEBUG DistAttention] rank={rank}, AFTER all2all (scatter heads): q.shape={q.shape}, k.shape={k.shape}, v.shape={v.shape}")
+            dist.barrier()
+            # END DEBUG
             q = depad_by_length(q,padding_tokens,2)
             k = depad_by_length(k,padding_tokens,2)
             v = depad_by_length(v,padding_tokens,2)
@@ -122,7 +141,13 @@ class DistAttention(Attention):
 
         if sp_size>1:
             x = pad_by_length(x,padding_tokens,2,0)
+            # DEBUG
+            print(f"[DEBUG DistAttention] rank={rank}, BEFORE reverse all2all: x.shape={x.shape}, head_pad={head_pad}")
+            dist.barrier()
             x = _All2All.apply(x,2,1,sp_group,False)
+            print(f"[DEBUG DistAttention] rank={rank}, AFTER reverse all2all (gather heads): x.shape={x.shape}")
+            dist.barrier()
+            # END DEBUG
             # Remove the head padding we added earlier
             x = depad_by_length(x, head_pad, dim=1)
 
