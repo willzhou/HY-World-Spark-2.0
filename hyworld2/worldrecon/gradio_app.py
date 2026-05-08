@@ -8,10 +8,13 @@ Usage:
 
 import argparse
 import gc
+import http.server
 import io
 import os
 import shutil
+import socketserver
 import sys
+import threading
 import time
 from datetime import datetime
 from glob import glob
@@ -106,6 +109,32 @@ def _mp_launch_fn(rank, pipeline_kwargs, examples_dir, host, port, share, mp_por
 
     if rank == 0:
         print(f"[Gradio] Rank 0 (mp.spawn): launching Gradio")
+        served_dir = Path.cwd() / "gradio_served"
+        served_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[Gradio] Static files directory: {served_dir}")
+
+        # Start simple HTTP server for static files on port 8090
+        import threading
+        import http.server
+        import socketserver
+
+        STATIC_PORT = 8090
+
+        class QuietHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=str(served_dir), **kwargs)
+            def log_message(self, format, *args):
+                pass  # Suppress request logging
+            def end_headers(self):
+                self.send_header('Access-Control-Allow-Origin', '*')
+                super().end_headers()
+
+        httpd = socketserver.TCPServer(("", STATIC_PORT), QuietHandler)
+        httpd.allow_reuse_address = True
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        print(f"[Static Server] Running on http://127.0.0.1:{STATIC_PORT} serving {served_dir}")
+
         demo = build_demo(examples_dir=examples_dir)
         try:
             demo.queue().launch(show_error=True, share=share,
@@ -580,6 +609,15 @@ def gradio_demo(
             save_gs_ply(gs_file, means, scales, quats, colors, opacities)
             print(f"[Save] gaussians.ply ({os.path.getsize(gs_file)} bytes)")
 
+            # Copy PLY to cwd so Gradio can serve it via /file=
+            import shutil as _shutil
+            cwd_gs_dir = os.path.join(os.getcwd(), "gradio_served")
+            os.makedirs(cwd_gs_dir, exist_ok=True)
+            cwd_gs_file = os.path.join(cwd_gs_dir, "gaussians.ply")
+            _shutil.copy2(gs_file, cwd_gs_file)
+            gs_file = cwd_gs_file  # Return the cwd-based path
+            print(f"[SPARK DEBUG] gradio_demo returning gs_file={gs_file}")
+
         depth_vis = update_depth_view(processed_data, 0)
         normal_vis = update_normal_view(processed_data, 0)
         d_sl, n_sl, d_info, n_info = update_view_selectors(processed_data)
@@ -760,27 +798,205 @@ def _nav_normal(pd, target):
 
 
 def _get_splat_url(output_dir, gs_file):
-    """Build Gradio file URL for the PLY splat file.
+    """Build URL for the PLY splat file via our static mount."""
+    # Check gradio_served directory (where we copied the PLY in gradio_demo)
+    served_path = os.path.join(os.getcwd(), "gradio_served", "gaussians.ply")
+    print(f"[SPARK] _get_splat_url: checking {served_path}, exists={os.path.isfile(served_path)}")
 
-    gs_file comes from invisible Model3D (gr.FileData object) or is a string path.
-    """
-    if gs_file is None:
-        return None
-    # Handle Gradio FileData object (from Model3D invisible component)
-    if hasattr(gs_file, 'path'):
-        file_path = gs_file.path
-    elif isinstance(gs_file, str):
-        file_path = gs_file
-    else:
-        return None
-    if not file_path or not os.path.isfile(file_path):
-        return None
-    return f"/file={file_path}"
+    if os.path.isfile(served_path):
+        # Return relative path for our StaticFiles mount at /gradio_served/
+        return "gradio_served/gaussians.ply"
+
+    # Fallback: try gs_file from gradio_demo output (absolute path)
+    if gs_file and isinstance(gs_file, str) and gs_file != "None" and os.path.isfile(gs_file):
+        print(f"[SPARK] Using gs_file fallback: {gs_file}")
+        return gs_file
+
+    # Fallback: try output_dir
+    if output_dir and output_dir != "None" and isinstance(output_dir, str):
+        ply_path = os.path.join(output_dir, "gaussians.ply")
+        if os.path.isfile(ply_path):
+            print(f"[SPARK] Using output_dir fallback: {ply_path}")
+            return ply_path
+
+    print(f"[SPARK ERROR] PLY not found anywhere. served={served_path}, gs_file={gs_file}, output_dir={output_dir}")
+    return None
 
 
 def _clear_spark():
     """Reset the Spark HTML overlay."""
     return None
+
+
+def _spark_js_callback():
+    """JavaScript code to load and display splat file using Spark.gl"""
+    return """
+async (url) => {
+    console.log("[Spark] Loading:", url);
+    if (!url) {
+        console.log("[Spark] No URL provided");
+        return;
+    }
+
+    // If already initialized, just load the file
+    if (window._sparkReady) {
+        console.log("[Spark] Already initialized, loading:", url);
+        try { await window._sparkLoadSplat(url); } catch(e) { console.error("[Spark] Error:", e); }
+        return;
+    }
+
+    // Show loading
+    const overlay = document.getElementById("spark-overlay");
+    const controls = document.getElementById("spark-controls");
+    const info = document.getElementById("spark-info");
+    if (overlay) overlay.innerHTML = '<div style="color:#888;">Loading 3D viewer...</div>';
+    if (controls) controls.style.display = "none";
+
+    try {
+        // Inject import map dynamically into document head
+        const importMap = {
+          imports: {
+            "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.180.0/three.module.js",
+            "spark": "https://sparkjs.dev/releases/spark/preview/2.0.0/spark.module.js"
+          }
+        };
+        const im = document.createElement('script');
+        im.type = 'importmap';
+        im.textContent = JSON.stringify(importMap);
+        document.head.appendChild(im);
+        console.log("[Spark] Import map injected");
+
+        // Now use bare imports which will resolve via import map
+        console.log("[Spark] Loading Three.js...");
+        const THREE = await import("three");
+
+        console.log("[Spark] Loading Spark...");
+        const spark = await import("spark");
+        const { SplatMesh, SparkRenderer, PackedSplats } = spark;
+
+        // Setup renderer
+        const canvas = document.getElementById("spark-canvas");
+        const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: "high-performance" });
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.setClearColor(0x000000, 1);
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(60, canvas.clientWidth / canvas.clientHeight || 1, 0.01, 1000);
+
+        const sparkRenderer = new SparkRenderer({ renderer, sortRadial: false, maxStdDev: Math.sqrt(9), minAlpha: 0.01, focalAdjustment: 2.0 });
+        scene.add(sparkRenderer);
+
+        // Orbit controls
+        let isDragging = false, prevX = 0, prevY = 0;
+        let yaw = 0, pitch = 0, targetYaw = 0, targetPitch = 0;
+        let autoSpin = false;
+        let splatCenter = new THREE.Vector3(0, 0, 0);
+
+        canvas.addEventListener('mousedown', e => { isDragging = true; prevX = e.clientX; prevY = e.clientY; });
+        window.addEventListener('mouseup', () => { isDragging = false; });
+        window.addEventListener('mousemove', e => {
+            if (!isDragging) return;
+            const dx = e.clientX - prevX, dy = e.clientY - prevY;
+            targetYaw -= dx * 0.005;
+            targetPitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, targetPitch - dy * 0.005));
+            prevX = e.clientX; prevY = e.clientY;
+        });
+
+        canvas.addEventListener('touchstart', e => { isDragging = true; prevX = e.touches[0].clientX; prevY = e.touches[0].clientY; });
+        window.addEventListener('touchend', () => { isDragging = false; });
+        window.addEventListener('touchmove', e => {
+            if (!isDragging) return;
+            const dx = e.touches[0].clientX - prevX, dy = e.touches[0].clientY - prevY;
+            targetYaw -= dx * 0.005;
+            targetPitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, targetPitch - dy * 0.005));
+            prevX = e.touches[0].clientX; prevY = e.touches[0].clientY;
+        });
+
+        window.addEventListener('resize', () => {
+            if (!canvas.clientWidth || !canvas.clientHeight) return;
+            renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+            camera.aspect = canvas.clientWidth / canvas.clientHeight;
+            camera.updateProjectionMatrix();
+        });
+
+        function animate() {
+            requestAnimationFrame(animate);
+            if (autoSpin && window._splatMesh) targetYaw += 0.005;
+            yaw += (targetYaw - yaw) * 0.1;
+            pitch += (targetPitch - pitch) * 0.1;
+            camera.position.set(Math.cos(pitch) * Math.sin(yaw) * 3, Math.sin(pitch) * 3, Math.cos(pitch) * Math.cos(yaw) * 3);
+            camera.lookAt(splatCenter);
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        // Function to load splat file
+        window._sparkLoadSplat = async function(url) {
+            if (window._splatMesh) { scene.remove(window._splatMesh); window._splatMesh.dispose(); window._splatMesh = null; }
+            const isPLY = url.toLowerCase().endsWith(".ply");
+            try {
+                if (isPLY) {
+                    // For PLY files, fetch from our static server on port 8090
+                    // Static server serves from {cwd}/gradio_served/, so URL is http://127.0.0.1:8090/gaussians.ply
+                    console.log("[Spark] Fetching PLY from static server:", url);
+                    let blob;
+                    try {
+                        const staticUrl = "http://127.0.0.1:8090/gaussians.ply";
+                        console.log("[Spark] Static URL:", staticUrl);
+                        const response = await fetch(staticUrl);
+                        if (!response.ok) throw new Error("HTTP " + response.status);
+                        blob = await response.blob();
+                    } catch(e) {
+                        console.warn("[Spark] Fetch failed:", e);
+                        throw e;
+                    }
+                    const blobUrl = URL.createObjectURL(blob);
+                    console.log("[Spark] Created blob URL:", blobUrl);
+                    const packed = new PackedSplats({ url: blobUrl }); await packed.initialized;
+                    window._splatMesh = new SplatMesh({ packedSplats: packed });
+                } else {
+                    window._splatMesh = new SplatMesh({ url });
+                }
+                window._splatMesh.quaternion.set(1, 0, 0, 0);
+                scene.add(window._splatMesh);
+                await window._splatMesh.initialized;
+
+                // Auto-scale and center
+                try {
+                    const bbox = window._splatMesh.getBoundingBox();
+                    const center = bbox.getCenter(new THREE.Vector3());
+                    const size = bbox.getSize(new THREE.Vector3());
+                    const maxDim = Math.max(size.x, size.y, size.z);
+                    if (maxDim > 0) { window._splatMesh.scale.setScalar(5 / maxDim); }
+                    window._splatMesh.position.sub(center.clone().multiplyScalar(window._splatMesh.scale.x));
+                    splatCenter = center.clone();
+                } catch(e) { console.warn("[Spark] BBox error:", e); window._splatMesh.scale.setScalar(1); }
+
+                if (overlay) overlay.style.display = "none";
+                if (controls) controls.style.display = "flex";
+                const n = window._splatMesh.packedSplats ? window._splatMesh.packedSplats.numSplats : null;
+                if (info) info.textContent = n != null ? n.toLocaleString() + " splats" : "loaded";
+            } catch(e) { console.error("[Spark] Load error:", e); if (overlay) overlay.innerHTML = '<div style="color:#f55;">Load failed: ' + (e.message || String(e)) + '</div>'; }
+        };
+
+        window.sparkReset = function() { targetYaw = 0; targetPitch = 0; autoSpin = false; const btn = document.getElementById("spin-btn"); if (btn) btn.textContent = "Auto Spin"; };
+        window.sparkToggleSpin = function() { autoSpin = !autoSpin; const btn = document.getElementById("spin-btn"); if (btn) btn.textContent = autoSpin ? "Stop Spin" : "Auto Spin"; };
+
+        // Store the URL that was passed in
+        window._sparkUrl = url;
+        window._sparkReady = true;
+        console.log("[Spark] Initialized");
+
+        // Check if there's a pending URL to load
+        if (window._sparkUrl) {
+            console.log("[Spark] Loading pending URL:", window._sparkUrl);
+            await window._sparkLoadSplat(window._sparkUrl);
+        } else {
+            console.log("[Spark] No pending URL");
+        }
+    } catch(e) { console.error("[Spark] Init error:", e); if (overlay) overlay.innerHTML = '<div style="color:#f55;">Failed: ' + (e.message || String(e)) + '</div>'; }
+}
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -814,14 +1030,25 @@ def build_demo(examples_dir="./examples/worldrecon"):
         max-height: none !important;
         overflow: visible !important;
     }
+    #gs-output-container { display: none !important; height: 0 !important; overflow: hidden !important; }
+    #gs-output-container > * { display: none !important; height: 0 !important; visibility: hidden !important; }
+    }
     """
 
     with gr.Blocks(theme=theme, css=css) as demo:
         is_example = gr.Textbox(visible=False, value="None")
         processed_data_state = gr.State(value=None)
-        gs_ply_state = gr.State(value=None)
+        gs_ply_state = gr.Textbox(visible=False, lines=1)
 
         gr.HTML("""
+        <script type="importmap">
+        {
+          "imports": {
+            "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.180.0/three.module.js",
+            "spark": "https://sparkjs.dev/releases/spark/preview/2.0.0/spark.module.js"
+          }
+        }
+        </script>
         <div style="text-align:center;">
         <h1>
             <span style="background:linear-gradient(90deg,#3b82f6,#1e40af);-webkit-background-clip:text;
@@ -868,8 +1095,10 @@ def build_demo(examples_dir="./examples/worldrecon"):
 
                 with gr.Tabs():
                     with gr.Tab("3D Gaussian Splatting", id=1):
-                        # Hidden dummy Model3D to capture gs_file path for JS interop
-                        gs_output = gr.Model3D(visible=False, height=1)
+                        # Hidden Model3D to capture gs_file path for JS interop
+                        gs_output = gr.Model3D(visible=True, height=1, elem_id="gs-output-container")
+
+                        # Static HTML for Spark container (no JS execution in gr.HTML)
                         spark_viewer_html = gr.HTML(f"""
                         <div id="spark-container" style="position:relative; width:100%; height:500px;
                              background:#111; border-radius:8px; overflow:hidden; margin:0;">
@@ -893,130 +1122,6 @@ def build_demo(examples_dir="./examples/worldrecon"):
                             </div>
                           </div>
                         </div>
-                        <script type="importmap">
-                        {{
-                          "imports": {{
-                            "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/r180/three.module.js",
-                            "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/2.0.0/spark.module.js"
-                          }}
-                        }}
-                        </script>
-                        <script type="module">
-                        import * as THREE from "three";
-                        import {{ SparkRenderer, SplatMesh }} from "@sparkjsdev/spark";
-
-                        let sparkRenderer, splatMesh, animFrame;
-                        let autoSpin = false;
-                        let initialized = false;
-
-                        const canvas = document.getElementById('spark-canvas');
-                        const overlay = document.getElementById('spark-overlay');
-                        const controls = document.getElementById('spark-controls');
-                        const info = document.getElementById('spark-info');
-
-                        function initSpark() {{
-                          if (sparkRenderer) return;
-                          const renderer = new THREE.WebGLRenderer({{
-                            canvas,
-                            antialias: false,
-                            powerPreference: "high-performance",
-                          }});
-                          renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-                          renderer.setClearColor(0x000000, 1);
-
-                          const scene = new THREE.Scene();
-                          const camera = new THREE.PerspectiveCamera(60, canvas.clientWidth / canvas.clientHeight, 0.01, 1000);
-
-                          sparkRenderer = new SparkRenderer({{ renderer }});
-                          scene.add(sparkRenderer);
-
-                          // Simple orbit controls via mouse drag
-                          let isDragging = false, prevX = 0, prevY = 0;
-                          let yaw = 0, pitch = 0;
-                          let targetYaw = 0, targetPitch = 0;
-
-                          canvas.addEventListener('mousedown', e => {{ isDragging = true; prevX = e.clientX; prevY = e.clientY; }});
-                          window.addEventListener('mouseup', () => {{ isDragging = false; }});
-                          window.addEventListener('mousemove', e => {{
-                            if (!isDragging) return;
-                            const dx = e.clientX - prevX, dy = e.clientY - prevY;
-                            targetYaw -= dx * 0.005;
-                            targetPitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, targetPitch - dy * 0.005));
-                            prevX = e.clientX; prevY = e.clientY;
-                          }});
-
-                          // Touch support
-                          canvas.addEventListener('touchstart', e => {{ isDragging = true; prevX = e.touches[0].clientX; prevY = e.touches[0].clientY; }});
-                          window.addEventListener('touchend', () => {{ isDragging = false; }});
-                          window.addEventListener('touchmove', e => {{
-                            if (!isDragging) return;
-                            const dx = e.touches[0].clientX - prevX, dy = e.touches[0].clientY - prevY;
-                            targetYaw -= dx * 0.005;
-                            targetPitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, targetPitch - dy * 0.005));
-                            prevX = e.touches[0].clientX; prevY = e.touches[0].clientY;
-                          }});
-
-                          window.addEventListener('resize', () => {{
-                            if (!canvas.clientWidth || !canvas.clientHeight) return;
-                            renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
-                            camera.aspect = canvas.clientWidth / canvas.clientHeight;
-                            camera.updateProjectionMatrix();
-                          }});
-
-                          function animate() {{
-                            animFrame = requestAnimationFrame(animate);
-                            if (autoSpin && splatMesh) targetYaw += 0.005;
-                            yaw += (targetYaw - yaw) * 0.1;
-                            pitch += (targetPitch - pitch) * 0.1;
-                            camera.position.set(
-                              Math.cos(pitch) * Math.sin(yaw) * 3,
-                              Math.sin(pitch) * 3,
-                              Math.cos(pitch) * Math.cos(yaw) * 3
-                            );
-                            camera.lookAt(0, 0, 0);
-                            renderer.render(scene, camera);
-                          }}
-                          animate();
-                          initialized = true;
-                        }}
-
-                        initSpark();
-
-                        window.loadSplatFile = async function(url) {{
-                          if (!initialized) initSpark();
-                          if (splatMesh) {{
-                            sparkRenderer.remove(splatMesh);
-                            splatMesh.dispose();
-                            splatMesh = null;
-                          }}
-                          overlay.innerHTML = '<div style="color:#888; font-family:monospace;">Loading splat file...</div>';
-                          try {{
-                            splatMesh = new SplatMesh({{ url }});
-                            splatMesh.quaternion.set(1, 0, 0, 0);
-                            sparkRenderer.add(splatMesh);
-                            await splatMesh.initialized;
-                            overlay.style.display = 'none';
-                            controls.style.display = 'flex';
-                            const n = splatMesh.packedSplats ? splatMesh.packedSplats.numSplats : '?';
-                            info.textContent = typeof n === 'number' ? `${{n.toLocaleString()}} splats` : 'splats loaded';
-                          }} catch (e) {{
-                            overlay.innerHTML = `<div style="color:#f55;">Load failed: ${{e.message || e}}</div>`;
-                          }}
-                        }};
-
-                        window.sparkReset = function() {{
-                          targetYaw = 0; targetPitch = 0;
-                          autoSpin = false;
-                          document.getElementById('spin-btn').textContent = 'Auto Spin';
-                        }};
-
-                        window.sparkToggleSpin = function() {{
-                          autoSpin = !autoSpin;
-                          document.getElementById('spin-btn').textContent = autoSpin ? 'Stop Spin' : 'Auto Spin';
-                        }};
-
-                        window.getSparkCanvas = () => canvas;
-                        </script>
                         """)
 
                     with gr.Tab("Point Cloud / Mesh", id=0):
@@ -1119,20 +1224,22 @@ def build_demo(examples_dir="./examples/worldrecon"):
         ).then(
             lambda url: url,
             [gs_ply_state],
-            [],
-            js="(url) => { if (url && window.loadSplatFile) { try { window.loadSplatFile(url); } catch(e) { console.error(e); } } }",
+            [gs_ply_state],
+            js=_spark_js_callback(),
         ).then(lambda: "False", [], [is_example])
 
         # ---- Events: Refresh 3D scene on option change ----
         _scene_inputs = [output_path_state, frame_selector, show_camera, is_example,
                          filter_sky_bg, show_mesh, filter_ambiguous]
-        _scene_outputs = [reconstruction_output, gs_output, log_output, gs_ply_state]
+        _scene_outputs = [reconstruction_output, gs_output, log_output]
         for ctrl in (frame_selector, show_camera, show_mesh):
             ctrl.change(refresh_3d_scene, _scene_inputs, _scene_outputs).then(
+                _get_splat_url, [output_path_state, gs_output], [gs_ply_state],
+            ).then(
                 lambda url: url,
                 [gs_ply_state],
-                [],
-                js="(url) => { if (url && window.loadSplatFile) { try { window.loadSplatFile(url); } catch(e) { console.error(e); } } }",
+                [gs_ply_state],
+                js=_spark_js_callback(),
             )
 
         _filter_inputs = [output_path_state, filter_sky_bg, processed_data_state,
@@ -1141,10 +1248,12 @@ def build_demo(examples_dir="./examples/worldrecon"):
 
         for ctrl in (filter_sky_bg, filter_ambiguous):
             ctrl.change(refresh_3d_scene, _scene_inputs, _scene_outputs).then(
+                _get_splat_url, [output_path_state, gs_output], [gs_ply_state],
+            ).then(
                 lambda url: url,
                 [gs_ply_state],
-                [],
-                js="(url) => { if (url && window.loadSplatFile) { try { window.loadSplatFile(url); } catch(e) { console.error(e); } } }",
+                [gs_ply_state],
+                js=_spark_js_callback(),
             ).then(
                 refresh_views_on_filter, _filter_inputs, _filter_outputs)
 
@@ -1268,20 +1377,41 @@ if __name__ == "__main__":
 
         if rank == 0:
             print("[Gradio] Rank 0: launching Gradio server")
+            served_dir = Path.cwd() / "gradio_served"
+            served_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[Gradio] Static files directory: {served_dir}")
+
+            # Start simple HTTP server for static files on port 8090
+            import threading
+            import http.server
+            import socketserver
+
+            STATIC_PORT = 8090
+
+            class QuietHandler(http.server.SimpleHTTPRequestHandler):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, directory=str(served_dir), **kwargs)
+                def log_message(self, format, *args):
+                    pass  # Suppress request logging
+                def end_headers(self):
+                    # Add CORS header to allow cross-origin requests
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    super().end_headers()
+
+            httpd = socketserver.TCPServer(("", STATIC_PORT), QuietHandler)
+            httpd.allow_reuse_address = True
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            print(f"[Static Server] Running on http://127.0.0.1:{STATIC_PORT} serving {served_dir}")
+
             demo = build_demo(examples_dir=args.examples_dir)
-            try:
-                demo.queue().launch(
-                    show_error=True,
-                    share=args.share,
-                    server_name=args.host,
-                    server_port=args.port,
-                    ssr_mode=False,
-                )
-            finally:
-                _broadcast_string("__QUIT__", rank, src=0)
-                import torch.distributed as dist
-                if dist.is_initialized():
-                    dist.destroy_process_group()
+            demo.queue().launch(
+                show_error=True,
+                share=args.share,
+                server_name=args.host,
+                server_port=args.port,
+                ssr_mode=False,
+            )
         else:
             _worker_loop()
     elif args.num_gpus > 1:
@@ -1307,6 +1437,34 @@ if __name__ == "__main__":
                  args=(pipeline_kwargs, args.examples_dir, args.host, args.port, args.share, args.mp_port),
                  nprocs=args.num_gpus, join=True)
     else:
+        from pathlib import Path
+        import threading
+        import http.server
+        import socketserver
+
+        # Create gradio_served directory for static file serving
+        served_dir = Path.cwd() / "gradio_served"
+        served_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[Gradio] Static files directory: {served_dir}")
+
+        # Start simple HTTP server for static files on port 8090
+        STATIC_PORT = 8090
+
+        class QuietHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=str(served_dir), **kwargs)
+            def log_message(self, format, *args):
+                pass  # Suppress request logging
+            def end_headers(self):
+                self.send_header('Access-Control-Allow-Origin', '*')
+                super().end_headers()
+
+        httpd = socketserver.TCPServer(("", STATIC_PORT), QuietHandler)
+        httpd.allow_reuse_address = True
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        print(f"[Static Server] Running on http://127.0.0.1:{STATIC_PORT} serving {served_dir}")
+
         demo = build_demo(examples_dir=args.examples_dir)
         demo.queue().launch(
             show_error=True,
