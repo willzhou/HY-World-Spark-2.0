@@ -872,7 +872,7 @@ async (url) => {
 
         console.log("[Spark] Loading Spark...");
         const spark = await import("spark");
-        const { SplatMesh, SparkRenderer, PackedSplats } = spark;
+        const { SplatMesh, SparkRenderer, SparkControls } = spark;
 
         // Setup renderer
         const canvas = document.getElementById("spark-canvas");
@@ -881,36 +881,15 @@ async (url) => {
         renderer.setClearColor(0x000000, 1);
 
         const scene = new THREE.Scene();
-        const camera = new THREE.PerspectiveCamera(60, canvas.clientWidth / canvas.clientHeight || 1, 0.01, 1000);
+        const camera = new THREE.PerspectiveCamera(75, canvas.clientWidth / canvas.clientHeight || 1, 0.01, 1000);
+        camera.position.set(0, 0, 1);  // Like official viewer example
 
-        const sparkRenderer = new SparkRenderer({ renderer, sortRadial: false, maxStdDev: Math.sqrt(9), minAlpha: 0.01, focalAdjustment: 2.0 });
+        const sparkRenderer = new SparkRenderer({ renderer });  // Simpler like official example
         scene.add(sparkRenderer);
 
-        // Orbit controls
-        let isDragging = false, prevX = 0, prevY = 0;
-        let yaw = 0, pitch = 0, targetYaw = 0, targetPitch = 0;
+        // Use SparkControls (wraps PointerControls + FpsMovement)
+        const controls = new SparkControls({ canvas });
         let autoSpin = false;
-        let splatCenter = new THREE.Vector3(0, 0, 0);
-
-        canvas.addEventListener('mousedown', e => { isDragging = true; prevX = e.clientX; prevY = e.clientY; });
-        window.addEventListener('mouseup', () => { isDragging = false; });
-        window.addEventListener('mousemove', e => {
-            if (!isDragging) return;
-            const dx = e.clientX - prevX, dy = e.clientY - prevY;
-            targetYaw -= dx * 0.005;
-            targetPitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, targetPitch - dy * 0.005));
-            prevX = e.clientX; prevY = e.clientY;
-        });
-
-        canvas.addEventListener('touchstart', e => { isDragging = true; prevX = e.touches[0].clientX; prevY = e.touches[0].clientY; });
-        window.addEventListener('touchend', () => { isDragging = false; });
-        window.addEventListener('touchmove', e => {
-            if (!isDragging) return;
-            const dx = e.touches[0].clientX - prevX, dy = e.touches[0].clientY - prevY;
-            targetYaw -= dx * 0.005;
-            targetPitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, targetPitch - dy * 0.005));
-            prevX = e.touches[0].clientX; prevY = e.touches[0].clientY;
-        });
 
         window.addEventListener('resize', () => {
             if (!canvas.clientWidth || !canvas.clientHeight) return;
@@ -919,13 +898,19 @@ async (url) => {
             camera.updateProjectionMatrix();
         });
 
-        function animate() {
+        function animate(time) {
             requestAnimationFrame(animate);
-            if (autoSpin && window._splatMesh) targetYaw += 0.005;
-            yaw += (targetYaw - yaw) * 0.1;
-            pitch += (targetPitch - pitch) * 0.1;
-            camera.position.set(Math.cos(pitch) * Math.sin(yaw) * 3, Math.sin(pitch) * 3, Math.cos(pitch) * Math.cos(yaw) * 3);
-            camera.lookAt(splatCenter);
+
+            // Update SparkControls (handles all input)
+            controls.update(camera);
+
+            // Auto spin
+            if (autoSpin && window._splatMesh) {
+                const euler = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
+                euler.y += 0.005;
+                camera.quaternion.setFromEuler(euler);
+            }
+
             renderer.render(scene, camera);
         }
         animate();
@@ -937,23 +922,10 @@ async (url) => {
             try {
                 if (isPLY) {
                     // For PLY files, fetch from our static server on port 8090
-                    // Static server serves from {cwd}/gradio_served/, so URL is http://127.0.0.1:8090/gaussians.ply
                     console.log("[Spark] Fetching PLY from static server:", url);
-                    let blob;
-                    try {
-                        const staticUrl = "http://127.0.0.1:8090/gaussians.ply";
-                        console.log("[Spark] Static URL:", staticUrl);
-                        const response = await fetch(staticUrl);
-                        if (!response.ok) throw new Error("HTTP " + response.status);
-                        blob = await response.blob();
-                    } catch(e) {
-                        console.warn("[Spark] Fetch failed:", e);
-                        throw e;
-                    }
-                    const blobUrl = URL.createObjectURL(blob);
-                    console.log("[Spark] Created blob URL:", blobUrl);
-                    const packed = new PackedSplats({ url: blobUrl }); await packed.initialized;
-                    window._splatMesh = new SplatMesh({ packedSplats: packed });
+                    const staticUrl = "http://127.0.0.1:8090/gaussians.ply";
+                    console.log("[Spark] Static URL:", staticUrl);
+                    window._splatMesh = new SplatMesh({ url: staticUrl });
                 } else {
                     window._splatMesh = new SplatMesh({ url });
                 }
@@ -961,16 +933,7 @@ async (url) => {
                 scene.add(window._splatMesh);
                 await window._splatMesh.initialized;
 
-                // Auto-scale and center
-                try {
-                    const bbox = window._splatMesh.getBoundingBox();
-                    const center = bbox.getCenter(new THREE.Vector3());
-                    const size = bbox.getSize(new THREE.Vector3());
-                    const maxDim = Math.max(size.x, size.y, size.z);
-                    if (maxDim > 0) { window._splatMesh.scale.setScalar(5 / maxDim); }
-                    window._splatMesh.position.sub(center.clone().multiplyScalar(window._splatMesh.scale.x));
-                    splatCenter = center.clone();
-                } catch(e) { console.warn("[Spark] BBox error:", e); window._splatMesh.scale.setScalar(1); }
+                console.log("[Spark] SplatMesh added to scene");
 
                 if (overlay) overlay.style.display = "none";
                 if (controls) controls.style.display = "flex";
@@ -979,7 +942,13 @@ async (url) => {
             } catch(e) { console.error("[Spark] Load error:", e); if (overlay) overlay.innerHTML = '<div style="color:#f55;">Load failed: ' + (e.message || String(e)) + '</div>'; }
         };
 
-        window.sparkReset = function() { targetYaw = 0; targetPitch = 0; autoSpin = false; const btn = document.getElementById("spin-btn"); if (btn) btn.textContent = "Auto Spin"; };
+        window.sparkReset = function() {
+            autoSpin = false;
+            camera.position.set(0, 0, 1);
+            camera.lookAt(0, 0, 0);
+            const btn = document.getElementById("spin-btn");
+            if (btn) btn.textContent = "Auto Spin";
+        };
         window.sparkToggleSpin = function() { autoSpin = !autoSpin; const btn = document.getElementById("spin-btn"); if (btn) btn.textContent = autoSpin ? "Stop Spin" : "Auto Spin"; };
 
         // Store the URL that was passed in
