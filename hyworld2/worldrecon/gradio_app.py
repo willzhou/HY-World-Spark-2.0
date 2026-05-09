@@ -831,225 +831,574 @@ def _clear_spark():
 def _spark_js_callback():
     """JavaScript code to load and display splat file using Spark.gl"""
     return """
-async (url) => {
-    console.log("[Spark] Loading:", url);
-    if (!url) {
-        console.log("[Spark] No URL provided");
-        return;
-    }
-
-    // If already initialized, just load the file
-    if (window._sparkReady) {
-        console.log("[Spark] Already initialized, loading:", url);
-        try { await window._sparkLoadSplat(url); } catch(e) { console.error("[Spark] Error:", e); }
-        return;
-    }
-
-    // Show loading
-    const overlay = document.getElementById("spark-overlay");
-    const controls = document.getElementById("spark-controls");
-    const info = document.getElementById("spark-info");
-    if (overlay) overlay.innerHTML = '<div style="color:#888;">Loading 3D viewer...</div>';
-    if (controls) controls.style.display = "none";
-
-    try {
-        // Inject import map dynamically into document head
-        const importMap = {
-          imports: {
-            "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.180.0/three.module.js",
-            "spark": "https://sparkjs.dev/releases/spark/preview/2.0.0/spark.module.js",
-            "lil-gui": "https://unpkg.com/lil-gui@0.19.3/dist/lil-gui.esm.js"
-          }
-        };
-        const im = document.createElement('script');
-        im.type = 'importmap';
-        im.textContent = JSON.stringify(importMap);
-        document.head.appendChild(im);
-        console.log("[Spark] Import map injected");
-
-        // Now use bare imports which will resolve via import map
-        console.log("[Spark] Loading Three.js...");
-        const THREE = await import("three");
-
-        console.log("[Spark] Loading Spark...");
-        const spark = await import("spark");
-        const { SplatMesh, SparkRenderer, SparkControls } = spark;
-
-        // Setup renderer
-        const canvas = document.getElementById("spark-canvas");
-        const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: "high-performance" });
-        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-        renderer.setClearColor(0x000000, 1);
-
-        const scene = new THREE.Scene();
-        const camera = new THREE.PerspectiveCamera(75, canvas.clientWidth / canvas.clientHeight || 1, 0.01, 1000);
-        camera.position.set(0, 0, 1);  // Like official viewer example
-
-        const sparkRenderer = new SparkRenderer({ renderer });  // Simpler like official example
-        scene.add(sparkRenderer);
-
-        // Use SparkControls (wraps PointerControls + FpsMovement)
-        const sparkControls = new SparkControls({ canvas });
-        let autoSpin = false;
-
-        window.addEventListener('resize', () => {
-            if (!canvas.clientWidth || !canvas.clientHeight) return;
-            renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
-            camera.aspect = canvas.clientWidth / canvas.clientHeight;
-            camera.updateProjectionMatrix();
-        });
-
-        function animate(time) {
-            requestAnimationFrame(animate);
-
-            // Update SparkControls (handles all input)
-            sparkControls.update(camera);
-
-            // Auto spin
-            if (autoSpin && window._splatMesh) {
-                const euler = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
-                euler.y += 0.005;
-                camera.quaternion.setFromEuler(euler);
+    async (url) => {
+        console.log("[Spark] Loading:", url);
+        if (!url) {
+            console.log("[Spark] No URL provided");
+            return;
+        }
+    
+        // If already initialized, just load the file
+        if (window._sparkReady) {
+            console.log("[Spark] Already initialized, loading:", url);
+            try { await window._sparkLoadSplat([url]); } catch(e) { console.error("[Spark] Error:", e); }
+            return;
+        }
+    
+        // Show loading
+        const overlay = document.getElementById("spark-overlay");
+        const controls = document.getElementById("spark-controls");
+        const info = document.getElementById("spark-info");
+        if (overlay) overlay.innerHTML = '<div style="color:#888;">Loading 3D viewer...</div>';
+        if (controls) controls.style.display = "none";
+    
+        try {
+            // Inject import map dynamically into document head
+            const importMap = {
+              imports: {
+                "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.180.0/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+                "spark": "https://sparkjs.dev/releases/spark/preview/2.0.0/spark.module.js",
+                "lil-gui": "http://127.0.0.1:8090/lil-gui.esm.js"
+              }
+            };
+            const im = document.createElement('script');
+            im.type = 'importmap';
+            im.textContent = JSON.stringify(importMap);
+            document.head.appendChild(im);
+            console.log("[Spark] Import map injected");
+    
+            console.log("[Spark] Loading Three.js...");
+            const THREE = await import("three");
+            const { OrbitControls } = await import("three/addons/controls/OrbitControls.js");
+    
+            console.log("[Spark] Loading Spark...");
+            const spark = await import("spark");
+            const { SplatMesh, SparkRenderer, SparkControls, constructGrid, isMobile, LN_SCALE_MIN, LN_SCALE_MAX } = spark;
+    
+            console.log("[Spark] Loading lil-gui...");
+            const { GUI } = await import("lil-gui");
+    
+            // ---- Setup renderer ----
+            const canvas = document.getElementById("spark-canvas");
+            const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: "high-performance" });
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.setClearColor(0x000000, 1);
+    
+            const scene = new THREE.Scene();
+            const camera = new THREE.PerspectiveCamera(75, canvas.clientWidth / canvas.clientHeight || 1, 0.01, 1000);
+            camera.position.set(0, 0, 1);
+    
+            const sparkRenderer = new SparkRenderer({ renderer });
+            scene.add(sparkRenderer);
+    
+            function handleResize() {
+                const width = canvas.clientWidth;
+                const height = canvas.clientHeight;
+                renderer.setSize(width, height, false);
+                camera.aspect = width / height;
+                camera.updateProjectionMatrix();
+            }
+            handleResize();
+            window.addEventListener("resize", handleResize);
+    
+            // ---- frame Group (official pattern: coord-independent transforms) ----
+            const frame = new THREE.Group();
+            frame.quaternion.set(1, 0, 0, 0);
+            scene.add(frame);
+    
+            // ---- Grid (procedural reference) ----
+            const grid = new SplatMesh({
+                constructSplats: (splats) => constructGrid({
+                    splats,
+                    extents: new THREE.Box3(new THREE.Vector3(-10, -10, -10), new THREE.Vector3(10, 10, 10)),
+                }),
+            });
+            grid.opacity = 0;
+            grid.visible = false;
+            scene.add(grid);
+    
+            // ---- Controls ----
+            const sparkControls = new SparkControls({ canvas });
+    
+            const orbitControls = new OrbitControls(camera, renderer.domElement);
+            orbitControls.enabled = false;
+            orbitControls.target.set(0, 0, 0);
+            orbitControls.minDistance = 0.1;
+            orbitControls.maxDistance = 10;
+    
+            // ---- Progress bar ----
+            const progressBar = document.getElementById("spark-progress-bar");
+            const progressFill = document.getElementById("spark-progress-fill");
+    
+            function showProgress() {
+                if (progressBar) { progressBar.style.display = "block"; progressFill.style.width = "0%"; }
+            }
+    
+            function updateProgress(progress) {
+                if (progressFill) { progressFill.style.width = Math.min(100, Math.max(0, progress * 100)) + "%"; }
+            }
+    
+            function hideProgress() {
+                if (progressBar) { progressBar.style.display = "none"; }
+            }
+    
+            function calculateUnknownProgress(loadedBytes) {
+                const midpointMB = 10 * 1024 * 1024;
+                return loadedBytes / (loadedBytes + midpointMB);
+            }
+    
+            async function fetchWithProgress(url) {
+                try {
+                    const response = await fetch(url, { mode: "cors", cache: "default" });
+                    if (!response.ok) { throw new Error("HTTP error! status: " + response.status); }
+                    const contentLength = response.headers.get("content-length");
+                    const total = contentLength ? parseInt(contentLength, 10) : null;
+                    const reader = response.body.getReader();
+                    const chunks = [];
+                    let loadedBytes = 0;
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        chunks.push(value);
+                        loadedBytes += value.length;
+                        const progress = total ? loadedBytes / total : calculateUnknownProgress(loadedBytes);
+                        updateProgress(progress);
+                    }
+                    const allChunks = new Uint8Array(loadedBytes);
+                    let offset = 0;
+                    for (const chunk of chunks) { allChunks.set(chunk, offset); offset += chunk.length; }
+                    return allChunks.buffer;
+                } catch (error) {
+                    hideProgress();
+                    throw error;
+                }
+            }
+    
+            // ---- GUI Options ----
+            const guiOptions = {
+                highDevicePixel: !isMobile(),
+                stats: false,
+                resetOnLoad: true,
+                loadOffset: 0,
+                coordSystem: "OpenGL",
+                autoRotate: false,
+                orbit: false,
+                reversePointerDir: false,
+                reversePointerSlide: false,
+                backgroundColor: "#111111",
+                viewBoundingBox: false,
+                showCones: false,
+                splatCount: "-",
+                openFiles: () => {},
+                loadFromText: "",
+                loadFromTextAction: () => {},
+                resetPose: () => {
+                    camera.position.set(0, 0, 1);
+                    camera.quaternion.set(0, 0, 0, 1);
+                    camera.fov = 75;
+                    resetFrameQuaternion();
+                    camera.updateProjectionMatrix();
+                },
+            };
+    
+            const splatExtra = { extSplats: true, lod: false };
+    
+            const splatEncoding = {
+                rgbMin: 0.0, rgbMax: 1.0,
+                lnScaleMin: LN_SCALE_MIN, lnScaleMax: LN_SCALE_MAX,
+                sh1Max: 1, sh2Max: 1, sh3Max: 1,
+                lodOpacity: false,
+            };
+    
+            function resetFrameQuaternion() {
+                if (guiOptions.coordSystem === "OpenCV") {
+                    frame.quaternion.set(1, 0, 0, 0);
+                } else if (guiOptions.coordSystem === "OpenGL") {
+                    frame.quaternion.set(0, 0, 0, 1);
+                } else if (guiOptions.coordSystem === "Z-up") {
+                    frame.quaternion.set(-1, 0, 0, 1).normalize();
+                }
             }
 
-            renderer.render(scene, camera);
-        }
-        animate();
-
-        // ---- lil-gui Editor Panels ----
-        const { GUI } = await import("lil-gui");
-        const gui = new GUI({ title: "Settings", container: document.getElementById("spark-gui") });
-        const splatsGui = new GUI({ title: "Splats", container: document.getElementById("spark-splats-gui") }).close();
-
-        const guiOptions = {
-            autoSpin: false,
-            backgroundColor: "#111111",
-            viewBoundingBox: false,
-            resetPose: () => {
-                camera.position.set(0, 0, 1);
-                camera.quaternion.set(0, 0, 0, 1);
-                camera.fov = 75;
+            function touch() { sparkRenderer.needsUpdate = true; }
+    
+            // ---- lil-gui Panels ----
+            const gui = new GUI({ title: "Settings", container: document.getElementById("spark-gui") });
+            const secondGui = new GUI({ title: "Splats", container: document.getElementById("spark-splats-gui") }).close();
+    
+            // -- Camera folder --
+            const cameraFolder = gui.addFolder("Camera").close();
+            const cameraPose = cameraFolder.addFolder("Camera Pose").close();
+            cameraPose.add(camera.position, "x", -10, 10, 0.01).name("X").listen();
+            cameraPose.add(camera.position, "y", -10, 10, 0.01).name("Y").listen();
+            cameraPose.add(camera.position, "z", -10, 10, 0.01).name("Z").listen();
+            const rotX = cameraPose.add(camera.rotation, "x", -Math.PI, Math.PI, 0.01).name("RotateX").listen();
+            const rotY = cameraPose.add(camera.rotation, "y", -Math.PI, Math.PI, 0.01).name("RotateY").listen();
+            const rotZ = cameraPose.add(camera.rotation, "z", -Math.PI, Math.PI, 0.01).name("RotateZ").listen();
+            cameraPose.add(camera, "fov", 1, 179, 1).name("Fov Y degrees").listen().onChange(() => {
                 camera.updateProjectionMatrix();
-            },
-        };
+            });
+    
+            cameraFolder.add(guiOptions, "resetPose").name("Reset pose");
+            cameraFolder.add(guiOptions, "coordSystem", ["OpenCV", "OpenGL", "Z-up"]).name("Coordinate system")
+                .listen().onChange(resetFrameQuaternion);
+            cameraFolder.add(guiOptions, "autoRotate").name("Auto rotate").listen().onChange((value) => {
+                if (value) { frame.rotation.y = 0; }
+            });
+            cameraFolder.add(guiOptions, "orbit").name("Orbit controls").listen().onChange((value) => {
+                orbitControls.enabled = value;
+                canvas.focus();
+                rotX.enable(!value);
+                rotY.enable(!value);
+                rotZ.enable(!value);
+            });
+            cameraFolder.add(guiOptions, "reversePointerDir").name("Reverse ptr direction").onChange((value) => {
+                sparkControls.pointerControls.reverseRotate = value;
+                sparkControls.pointerControls.reverseScroll = value;
+            });
+            cameraFolder.add(guiOptions, "reversePointerSlide").name("Reverse ptr slide").onChange((value) => {
+                sparkControls.pointerControls.reverseSlide = value;
+                sparkControls.pointerControls.reverseSwipe = value;
+            });
+    
+            // -- Level-of-Detail folder --
+            const lodFolder = gui.addFolder("Level-of-Detail").close();
+            lodFolder.add(splatExtra, "lod").name("Create Level-of-Detail on load");
+            lodFolder.add(sparkRenderer, "lodSplatScale", 0.001, 3.0, 0.001).name("LoD splat scale").listen();
+            lodFolder.add(guiOptions, "splatCount").name("Current splat count").listen();
+            lodFolder.add(sparkRenderer, "coneFov0", 0.0, 170.0, 1.0).name("Cone Fov0").listen().onChange(updateConeMeshes);
+            lodFolder.add(sparkRenderer, "coneFov", 0.0, 170.0, 1.0).name("Cone Fov").listen().onChange(updateConeMeshes);
+            lodFolder.add(guiOptions, "showCones").name("Show FOV cones").listen().onChange((show) => {
+                if (cone0Mesh) cone0Mesh.visible = show;
+                if (coneMesh) coneMesh.visible = show;
+            });
+            lodFolder.add(sparkRenderer, "coneFoveate", 0.0, 1.0, 0.01).name("Cone Foveate").listen();
+            lodFolder.add(sparkRenderer, "behindFoveate", 0.0, 1.0, 0.01).name("Behind Foveate").listen();
+            lodFolder.add(sparkRenderer, "enableDriveLod").name("Enable LoD updates").listen();
+            lodFolder.add(sparkRenderer, "lodInflate").name("Soften LoD splats").listen();
 
-        const splatOptions = {
-            opacity: 1.0,
-            scale: 1.0,
-            maxSh: 3,
-            posX: 0, posY: 0, posZ: 0,
-            rotX: 0, rotY: 0, rotZ: 0,
-        };
-
-        function applySplatOptions() {
-            if (!window._splatMesh) return;
-            window._splatMesh.opacity = splatOptions.opacity;
-            window._splatMesh.scale.setScalar(splatOptions.scale);
-            window._splatMesh.position.set(splatOptions.posX, splatOptions.posY, splatOptions.posZ);
-            window._splatMesh.rotation.set(splatOptions.rotX, splatOptions.rotY, splatOptions.rotZ);
-            window._splatMesh.visible = splatOptions.opacity > 0;
-        }
-
-        // Main GUI (right side)
-        const cameraFolder = gui.addFolder("Camera").close();
-        cameraFolder.add(camera.position, "x", -10, 10, 0.01).name("X").listen();
-        cameraFolder.add(camera.position, "y", -10, 10, 0.01).name("Y").listen();
-        cameraFolder.add(camera.position, "z", -10, 10, 0.01).name("Z").listen();
-        cameraFolder.add(camera, "fov", 1, 179, 1).name("FOV").listen().onChange(() => {
-            camera.updateProjectionMatrix();
-        });
-        gui.add(guiOptions, "autoSpin").name("Auto Spin").onChange((v) => { autoSpin = v; });
-        gui.add(guiOptions, "resetPose").name("Reset Pose");
-        gui.addColor(guiOptions, "backgroundColor").name("Background").onChange((v) => {
-            scene.background = new THREE.Color(v);
-        });
-        scene.background = new THREE.Color(guiOptions.backgroundColor);
-
-        // Splats GUI (left side)
-        const sf = splatsGui.addFolder("File").close();
-        sf.add(splatOptions, "opacity", 0, 1, 0.01).name("Opacity").onChange(applySplatOptions);
-        sf.add(splatOptions, "scale", 0.01, 4, 0.01).name("Scale").onChange(applySplatOptions);
-        sf.add(splatOptions, "maxSh", 0, 3, 1).name("Max SH").onChange(() => {
-            if (window._splatMesh) window._splatMesh.updateGenerator();
-        });
-        const posFolder = sf.addFolder("Position").close();
-        posFolder.add(splatOptions, "posX", -10, 10, 0.01).name("X").onChange(applySplatOptions);
-        posFolder.add(splatOptions, "posY", -10, 10, 0.01).name("Y").onChange(applySplatOptions);
-        posFolder.add(splatOptions, "posZ", -10, 10, 0.01).name("Z").onChange(applySplatOptions);
-        const rotFolder = sf.addFolder("Rotation").close();
-        rotFolder.add(splatOptions, "rotX", -Math.PI, Math.PI, 0.01).name("X").onChange(applySplatOptions);
-        rotFolder.add(splatOptions, "rotY", -Math.PI, Math.PI, 0.01).name("Y").onChange(applySplatOptions);
-        rotFolder.add(splatOptions, "rotZ", -Math.PI, Math.PI, 0.01).name("Z").onChange(applySplatOptions);
-        splatsGui.add(guiOptions, "viewBoundingBox").name("Show BBox").onChange((v) => {
-            if (window._bboxHelper) window._bboxHelper.visible = v;
-        });
-
-        console.log("[Spark] Editor panels initialized");
-
-        // Function to load splat file
-        window._sparkLoadSplat = async function(url) {
-            if (window._splatMesh) { scene.remove(window._splatMesh); window._splatMesh.dispose(); window._splatMesh = null; }
-            const isPLY = url.toLowerCase().endsWith(".ply");
-            try {
-                if (isPLY) {
-                    // For PLY files, fetch from our static server on port 8090
-                    console.log("[Spark] Fetching PLY from static server:", url);
-                    const staticUrl = "http://127.0.0.1:8090/gaussians.ply";
-                    console.log("[Spark] Static URL:", staticUrl);
-                    window._splatMesh = new SplatMesh({ url: staticUrl });
-                } else {
-                    window._splatMesh = new SplatMesh({ url });
+            // -- Main GUI (continued) --
+            gui.add(guiOptions, "highDevicePixel").name("High DPI").onChange((value) => { setHighDpi(value); });
+            gui.add(sparkRenderer, "sortRadial").name("Radial sort").listen();
+            gui.add(grid, "opacity", 0, 1, 0.01).name("Grid opacity").listen().onChange((value) => {
+                grid.visible = value > 0;
+            });
+            gui.add({ logFocalDistance: 0.0 }, "logFocalDistance", -2, 2, 0.01).name("Ln(Focal distance)").onChange((value) => {
+                sparkRenderer.focalDistance = Math.exp(value);
+            });
+            gui.add(sparkRenderer, "apertureAngle", 0, 0.01 * Math.PI, 0.001).name("Aperture angle").listen();
+            scene.background = new THREE.Color(guiOptions.backgroundColor);
+            gui.addColor(guiOptions, "backgroundColor").name("Background color").onChange((value) => {
+                scene.background.set(value);
+            });
+    
+            // -- Debug folder --
+            const debugFolder = gui.addFolder("Debug").close();
+            debugFolder.add(guiOptions, "viewBoundingBox").name("View bounding boxes").onChange((v) => {
+                frame.children.forEach((child) => {
+                    if (child instanceof THREE.Box3Helper) { child.visible = v; }
+                });
+            });
+            debugFolder.add(sparkRenderer, "maxStdDev", 0.1, 3.0, 0.01).name("Max Gsplat stddev").listen();
+            debugFolder.add(sparkRenderer, "falloff", 0, 1, 0.01).name("Gaussian falloff").listen();
+            debugFolder.add(sparkRenderer, "preBlurAmount", 0, 2, 0.1).name("Blur amount (no AA)").listen();
+            debugFolder.add(sparkRenderer, "blurAmount", 0, 2, 0.1).name("Blur amount (AA)").listen();
+            debugFolder.add({ nonAA: () => { sparkRenderer.preBlurAmount = 0.3; sparkRenderer.blurAmount = 0.0; } }, "nonAA").name("Non-AA preset");
+            debugFolder.add({ AA: () => { sparkRenderer.preBlurAmount = 0.0; sparkRenderer.blurAmount = 0.3; } }, "AA").name("AA preset");
+            debugFolder.add(sparkRenderer, "focalAdjustment", 0.1, 2.0, 0.1).name("Tweak focalAdjustment").listen();
+            debugFolder.add(sparkRenderer, "minPixelRadius", 0, 16, 0.1).name("Min pixel radius").listen();
+            debugFolder.add(sparkRenderer, "maxPixelRadius", 1, 1024, 1).name("Max pixel radius").listen();
+            debugFolder.add(sparkRenderer, "minAlpha", 0, 1, 0.001).name("Min alpha").listen();
+            debugFolder.add(sparkRenderer, "premultipliedAlpha").name("Premultiplied alpha").listen();
+    
+            // -- SplatMesh encoding folder --
+            const splatFolder = gui.addFolder("SplatMesh encoding").close();
+            splatFolder.add(splatExtra, "extSplats").name("Extended splats");
+            splatFolder.add(splatEncoding, "rgbMin", -1, 1, 0.1).name("RGB min").onChange(touch);
+            splatFolder.add(splatEncoding, "rgbMax", 0, 4, 0.1).name("RGB max").onChange(touch);
+            splatFolder.add(splatEncoding, "lnScaleMin", -14, -2.5, 0.1).name("Ln scale min").onChange(touch);
+            splatFolder.add(splatEncoding, "lnScaleMax", -14, 14, 0.1).name("Ln scale max").onChange(touch);
+            splatFolder.add(splatEncoding, "sh1Max", -6, 6, 0.1).name("SH1 max").onChange(touch);
+            splatFolder.add(splatEncoding, "sh2Max", -6, 6, 0.1).name("SH2 max").onChange(touch);
+            splatFolder.add(splatEncoding, "sh3Max", -6, 6, 0.1).name("SH3 max").onChange(touch);
+    
+            // -- Splats GUI (left panel) --
+            guiOptions.openFiles = () => {
+                const fileInput = document.getElementById("spark-file-input");
+                if (fileInput) fileInput.click();
+            };
+            guiOptions.loadFromTextAction = () => {
+                if (guiOptions.loadFromText.trim()) {
+                    const urls = parseURLsFromText(guiOptions.loadFromText);
+                    if (urls.length > 0) { loadFiles(urls); guiOptions.loadFromText = ""; }
+                    else { alert("No valid URLs found. URLs must start with http:// or https:// and end with .ply, .spz, .splat, .ksplat, .json, .zip, .sog, or .rad"); }
                 }
-                window._splatMesh.quaternion.set(1, 0, 0, 0);
-                scene.add(window._splatMesh);
-                await window._splatMesh.initialized;
+            };
 
-                console.log("[Spark] SplatMesh added to scene");
+            // File input change handler
+            const fileInput = document.getElementById("spark-file-input");
+            if (fileInput) {
+                fileInput.onchange = (event) => {
+                    loadFiles([...event.target.files]);
+                };
+            }
 
-                // Update bounding box helper
-                if (window._bboxHelper) { scene.remove(window._bboxHelper); }
-                try {
-                    const box = window._splatMesh.getBoundingBox();
-                    window._bboxHelper = new THREE.Box3Helper(box, 0x00ff00);
-                    window._bboxHelper.visible = guiOptions.viewBoundingBox;
-                    scene.add(window._bboxHelper);
-                } catch(e) { console.warn("[Spark] BBox helper error:", e); }
+            secondGui.add(guiOptions, "resetOnLoad").name("Reset on load");
+            secondGui.add(guiOptions, "loadOffset", -2, 2, 0.01).name("Loading offset");
+            secondGui.add(guiOptions, "openFiles").name("Select Files");
+            secondGui.add(guiOptions, "loadFromText").name("Paste URL(s) here");
+            secondGui.add(guiOptions, "loadFromTextAction").name("Load from URL(s)");
+    
+            const splatsFolder = secondGui.addFolder("Files");
+    
+            // ---- Cone meshes for FOV visualization ----
+            let cone0Mesh = null;
+            let coneMesh = null;
+            function makeConeMesh(fov0) {
+                const radius = 32; const height = 32; const segments = 32;
+                const geometry = new THREE.ConeGeometry(radius, height, segments, 1, true);
+                geometry.translate(0, -height / 2, 0);
+                geometry.rotateX(Math.PI / 2);
+                const edges = new THREE.EdgesGeometry(geometry);
+                return new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: fov0 ? 0xffcc00 : 0x00ccff }));
+            }
+            function makeConeCircles(fov0) {
+                const group = new THREE.Group();
+                const segments = 32;
+                const color = fov0 ? 0xffcc00 : 0x00ccff;
+                const material = new THREE.LineBasicMaterial({ color });
+                for (const z of [0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]) {
+                    const geom = new THREE.BufferGeometry();
+                    const vertices = [];
+                    for (let j = 0; j <= segments; ++j) {
+                        const theta = (j / segments) * 2 * Math.PI;
+                        vertices.push(Math.cos(theta) * z, Math.sin(theta) * z, -z);
+                    }
+                    geom.setAttribute("position", new THREE.Float32BufferAttribute(vertices, 3));
+                    group.add(new THREE.Line(geom, material));
+                }
+                group.add(makeConeMesh(fov0));
+                return group;
+            }
+            cone0Mesh = makeConeCircles(true);
+            cone0Mesh.visible = false;
+            scene.add(cone0Mesh);
+            coneMesh = makeConeCircles(false);
+            coneMesh.visible = false;
+            scene.add(coneMesh);
+    
+            function updateConeMeshes() {
+                const tan0 = Math.tan(0.5 * sparkRenderer.coneFov0 * Math.PI / 180);
+                cone0Mesh.scale.set(tan0, tan0, 1);
+                const tan = Math.tan(0.5 * sparkRenderer.coneFov * Math.PI / 180);
+                coneMesh.scale.set(tan, tan, 1);
+            }
+            updateConeMeshes();
+    
+            // ---- High DPI ----
+            function setHighDpi(value) {
+                renderer.setPixelRatio(value ? window.devicePixelRatio : 1);
+                const width = canvas.clientWidth;
+                const height = canvas.clientHeight;
+                renderer.setSize(width, height, false);
+            }
+            setHighDpi(guiOptions.highDevicePixel);
+    
+            // ---- Bounding box helper ----
+            async function addBoundingBoxHelper(splatMesh) {
+                await splatMesh.initialized;
+                const box = splatMesh.getBoundingBox();
+                const boxHelper = new THREE.Box3Helper(box, 0x00ff00);
+                boxHelper.visible = guiOptions.viewBoundingBox;
+                frame.add(boxHelper);
+            }
+    
+            // ---- loadFiles function (official pattern) ----
+            async function loadFiles(splatFiles) {
+                if (guiOptions.resetOnLoad) {
+                    const toRemove = frame.children.filter((child) => child instanceof SplatMesh || child instanceof THREE.Box3Helper);
+                    for (const child of toRemove) { frame.remove(child); }
+                    splatsFolder.foldersRecursive().forEach((child) => child.destroy());
+                }
+    
+                guiOptions.autoRotate = false;
+                resetFrameQuaternion();
+    
+                const hasUrls = splatFiles.some(function(file) { return typeof file === "string"; });
+                if (hasUrls) { showProgress(); }
+    
+                let index = 0;
+                for (const splatFile of splatFiles) {
+                    try {
+                        let fileName = undefined;
+                        let stream = undefined;
+                        let streamLength = undefined;
+                        let url = undefined;
+    
+                        if (typeof splatFile === "string") {
+                            url = splatFile;
+                            // Rewrite gradio_served/ paths to use the static file server on port 8090
+                            if (url.includes("gradio_served/")) {
+                                const filename = url.split("/").pop();
+                                url = "http://127.0.0.1:8090/" + filename;
+                                console.log("[Spark] Rewrote URL to static server:", url);
+                            }
+                            fileName = splatFile.split("/").pop().split("?")[0] || "downloaded-file";
+                        } else {
+                            fileName = splatFile.name;
+                            stream = splatFile.stream();
+                            streamLength = splatFile.size;
+                        }
+    
+                        // Build SplatMesh init with splatExtra and splatEncoding
+                        const init = { url, fileName, stream, streamLength };
+                        for (const k in splatExtra) { if (splatExtra.hasOwnProperty(k)) init[k] = splatExtra[k]; }
+                        init.splatEncoding = {};
+                        for (const k in splatEncoding) { if (splatEncoding.hasOwnProperty(k)) init.splatEncoding[k] = splatEncoding[k]; }
 
-                // Apply initial splat options
-                applySplatOptions();
+                        const splatMesh = new SplatMesh(init);
+                        const translate = guiOptions.loadOffset * index;
+                        splatMesh.position.set(translate, 0.5 * translate, 0.1 * translate);
+                        splatMesh.enableWorldToView = true;
+                        await splatMesh.initialized;
 
-                if (overlay) overlay.style.display = "none";
-                if (controls) controls.style.display = "flex";
-                const n = window._splatMesh.packedSplats ? window._splatMesh.packedSplats.numSplats : null;
-                if (info) info.textContent = n != null ? n.toLocaleString() + " splats" : "loaded";
-            } catch(e) { console.error("[Spark] Load error:", e); if (overlay) overlay.innerHTML = '<div style="color:#f55;">Load failed: ' + (e.message || String(e)) + '</div>'; }
-        };
-
-        window.sparkReset = function() {
-            autoSpin = false;
-            camera.position.set(0, 0, 1);
-            camera.lookAt(0, 0, 0);
-            const btn = document.getElementById("spin-btn");
-            if (btn) btn.textContent = "Auto Spin";
-        };
-        window.sparkToggleSpin = function() { autoSpin = !autoSpin; const btn = document.getElementById("spin-btn"); if (btn) btn.textContent = autoSpin ? "Stop Spin" : "Auto Spin"; };
-
-        // Store the URL that was passed in
-        window._sparkUrl = url;
-        window._sparkReady = true;
-        console.log("[Spark] Initialized");
-
-        // Check if there's a pending URL to load
-        if (window._sparkUrl) {
-            console.log("[Spark] Loading pending URL:", window._sparkUrl);
-            await window._sparkLoadSplat(window._sparkUrl);
-        } else {
-            console.log("[Spark] No pending URL");
+                        frame.add(splatMesh);
+                        // Show lil-gui panels after first splat loads
+                        document.getElementById("spark-gui").classList.add("lil-ready");
+                        document.getElementById("spark-splats-gui").classList.add("lil-ready");
+                        const numSplats = splatMesh.splats ? (splatMesh.splats.lodSplats ? splatMesh.splats.lodSplats.numSplats : splatMesh.splats.numSplats) : null;
+                        console.log("Loaded " + fileName + " with " + numSplats + " splats");
+                        addBoundingBoxHelper(splatMesh);
+    
+                        // Per-file folder in Splats GUI
+                        const splatFolder = splatsFolder.addFolder(fileName).close();
+                        splatFolder.add(splatMesh, "opacity", 0, 1, 0.01).name("Opacity").listen();
+                        splatFolder.add(splatMesh.position, "x", -10, 10, 0.01).name("X").listen();
+                        splatFolder.add(splatMesh.position, "y", -10, 10, 0.01).name("Y").listen();
+                        splatFolder.add(splatMesh.position, "z", -10, 10, 0.01).name("Z").listen();
+                        splatFolder.add(splatMesh.scale, "x", 0.01, 4, 0.01).name("Scale").listen().onChange((value) => {
+                            splatMesh.scale.setScalar(value);
+                        });
+                        splatFolder.add(splatMesh.rotation, "x", -Math.PI, Math.PI, 0.01).name("RotateX").listen();
+                        splatFolder.add(splatMesh.rotation, "y", -Math.PI, Math.PI, 0.01).name("RotateY").listen();
+                        splatFolder.add(splatMesh.rotation, "z", -Math.PI, Math.PI, 0.01).name("RotateZ").listen();
+                        splatFolder.add(splatMesh, "maxSh", 0, 3, 1).name("Max SH").listen().onChange(() => {
+                            splatMesh.updateGenerator();
+                        });
+                    } catch (error) {
+                        console.error("Error loading splat file:", error);
+                    }
+                    index += 1;
+                }
+    
+                if (hasUrls) { hideProgress(); }
+                canvas.focus();
+            }
+    
+            // ---- Drag & drop ----
+            canvas.addEventListener("dragover", (e) => {
+                e.preventDefault();
+                canvas.style.opacity = "0.5";
+            });
+            canvas.addEventListener("dragleave", (e) => {
+                e.preventDefault();
+                canvas.style.opacity = "1";
+            });
+            canvas.addEventListener("drop", async (e) => {
+                e.preventDefault();
+                canvas.style.opacity = "1";
+                const textData = e.dataTransfer.getData("text/plain");
+                if (textData) {
+                    const urls = parseURLsFromText(textData);
+                    if (urls.length > 0) { loadFiles(urls); return; }
+                }
+                const files = Array.from(e.dataTransfer.files);
+                const exts = [".ply", ".spz", ".splat", ".ksplat", ".zip", ".sog", ".rad"];
+                const splatFiles = files.filter(function(f) {
+                    return exts.some(function(ext) { return f.name.toLowerCase().endsWith(ext); });
+                });
+                if (splatFiles.length > 0) { loadFiles(splatFiles); }
+            });
+    
+            function parseURLsFromText(text) {
+                const supportedExtensions = [".ply", ".spz", ".splat", ".ksplat", ".zip", ".json", ".sog", ".rad"];
+                const urls = [];
+                const parts = text.trim().split(/[\\r\\n,;]+/);
+                for (const part of parts) {
+                    const trimmed = part.trim();
+                    if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+                        if (supportedExtensions.some(function(ext) { return trimmed.toLowerCase().includes(ext); })) {
+                            urls.push(trimmed);
+                        }
+                    }
+                }
+                return urls;
+            }
+    
+            // ---- Expose load function ----
+            window._sparkLoadSplat = loadFiles;
+    
+            console.log("[Spark] Editor panels initialized");
+    
+            // Focus canvas for keyboard controls
+            canvas.focus();
+    
+            // ---- Render loop ----
+            let lastTime = null;
+            renderer.setAnimationLoop(function animate(time) {
+                const deltaTime = time - (lastTime || time);
+                lastTime = time;
+    
+                // Auto rotate via frame group
+                if (guiOptions.autoRotate) {
+                    if (guiOptions.coordSystem === "OpenCV") {
+                        frame.rotation.y = time / 5000;
+                    } else if (guiOptions.coordSystem === "OpenGL") {
+                        frame.rotation.y = -time / 5000;
+                    } else if (guiOptions.coordSystem === "Z-up") {
+                        frame.rotation.z = -time / 5000;
+                    }
+                }
+    
+                // Update controls
+                if (guiOptions.orbit) {
+                    orbitControls.update();
+                } else {
+                    sparkControls.update(camera);
+                }
+    
+                // Update cone mesh positions
+                const lodPos = sparkRenderer.currentLod ? (sparkRenderer.currentLod.pos || new THREE.Vector3().copy(camera.position)) : new THREE.Vector3().copy(camera.position);
+                const lodQuat = sparkRenderer.currentLod ? (sparkRenderer.currentLod.quat || new THREE.Quaternion().copy(camera.quaternion)) : new THREE.Quaternion().copy(camera.quaternion);
+                if (cone0Mesh) { cone0Mesh.position.copy(lodPos); cone0Mesh.quaternion.copy(lodQuat); }
+                if (coneMesh) { coneMesh.position.copy(lodPos); coneMesh.quaternion.copy(lodQuat); }
+    
+                renderer.render(scene, camera);
+                guiOptions.splatCount = sparkRenderer.display ? ("" + sparkRenderer.display.numSplats) : "-";
+            });
+    
+            // ---- Hide overlay, show controls ----
+            if (overlay) overlay.style.display = "none";
+            if (controls) controls.style.display = "flex";
+    
+            // Mark initialized
+            window._sparkReady = true;
+    
+            // Load file immediately if URL was provided
+            if (url) {
+                console.log("[Spark] Loading initial URL:", url);
+                await window._sparkLoadSplat([url]);
+            }
+    
+            console.log("[Spark] Initialized");
+        } catch(e) {
+            console.error("[Spark] Init error:", e);
+            if (overlay) overlay.innerHTML = '<div style="color:#f55;">Failed: ' + (e.message || String(e)) + '</div>';
         }
-    } catch(e) { console.error("[Spark] Init error:", e); if (overlay) overlay.innerHTML = '<div style="color:#f55;">Failed: ' + (e.message || String(e)) + '</div>'; }
-}
+    }
+    
 """
-
 
 # ---------------------------------------------------------------------------
 # Gradio UI
@@ -1097,8 +1446,9 @@ def build_demo(examples_dir="./examples/worldrecon"):
         {
           "imports": {
             "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.180.0/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
             "spark": "https://sparkjs.dev/releases/spark/preview/2.0.0/spark.module.js",
-            "lil-gui": "https://unpkg.com/lil-gui@0.19.3/dist/lil-gui.esm.js"
+            "lil-gui": "http://127.0.0.1:8090/lil-gui.esm.js"
           }
         }
         </script>
@@ -1155,6 +1505,12 @@ def build_demo(examples_dir="./examples/worldrecon"):
                         spark_viewer_html = gr.HTML(f"""
                         <div id="spark-container" style="position:relative; width:100%; height:500px;
                              background:#111; border-radius:8px; overflow:hidden; margin:0;">
+                          <div id="spark-progress-bar" style="position:absolute; top:0; left:0; width:100%; height:4px;
+                               background-color:rgba(0,0,0,0.1); z-index:1000; display:none;">
+                            <div id="spark-progress-fill" style="height:100%;
+                                 background:linear-gradient(90deg, #4CAF50, #45a049); width:0%;
+                                 transition:width 0.3s ease;"></div>
+                          </div>
                           <canvas id="spark-canvas" style="display:block; width:100%; height:100%; outline:none;" tabindex="0"></canvas>
                           <div id="spark-overlay" style="position:absolute; top:0; left:0; right:0; bottom:0;
                                display:flex; align-items:center; justify-content:center; flex-direction:column;
@@ -1162,19 +1518,25 @@ def build_demo(examples_dir="./examples/worldrecon"):
                             <div style="font-size:18px; margin-bottom:8px;">📡</div>
                             <div>Click "Reconstruct" to generate 3DGS</div>
                           </div>
+                          <style>
+                            /* Hide lil-gui panels initially */
+                            #spark-gui .lil-gui, #spark-splats-gui .lil-gui {{ display: none !important; }}
+                            /* White text for all lil-gui elements on dark background */
+                            .lil-gui, .lil-gui *, .lil-root {{ color: #e8e8e8 !important; font-family: monospace !important; }}
+                            .lil-gui .lil-title {{ color: #ffffff !important; font-weight: 600 !important; font-family: monospace !important; }}
+                            .lil-gui input, .lil-gui select, .lil-gui textarea {{ color: #e0e0e0 !important; background: #2a2a2a !important; }}
+                            .lil-gui button {{ color: #ffffff !important; }}
+                            .lil-gui .title {{ color: #ffffff !important; }}
+                            /* Show panels when splat is loaded (class added by JS) */
+                            #spark-gui.lil-ready .lil-gui, #spark-splats-gui.lil-ready .lil-gui {{ display: block !important; }}
+                          </style>
                           <div id="spark-gui" style="position:absolute; top:5px; right:5px; z-index:10;"></div>
                           <div id="spark-splats-gui" style="position:absolute; top:5px; left:5px; z-index:10;"></div>
+                          <input id="spark-file-input" type="file" accept=".ply,.spz,.splat,.ksplat,.zip,.sog,.rad" multiple="true" style="display:none;" />
                           <div id="spark-controls" style="position:absolute; bottom:12px; left:12px; right:12px;
                                display:none; justify-content:space-between; align-items:center; color:#ccc;
                                font-family:monospace; font-size:12px;">
                             <div id="spark-info"></div>
-                            <div style="display:flex; gap:8px;">
-                              <button onclick="sparkReset()" style="background:#333; color:#fff; border:1px solid #555;
-                                   padding:4px 10px; border-radius:4px; cursor:pointer;">Reset</button>
-                              <button onclick="sparkToggleSpin()" id="spin-btn"
-                                   style="background:#333; color:#fff; border:1px solid #555;
-                                   padding:4px 10px; border-radius:4px; cursor:pointer;">Auto Spin</button>
-                            </div>
                           </div>
                         </div>
                         """)
