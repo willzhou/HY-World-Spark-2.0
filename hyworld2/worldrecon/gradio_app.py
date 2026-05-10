@@ -856,9 +856,9 @@ def _spark_js_callback():
             // Inject import map dynamically into document head
             const importMap = {
               imports: {
-                "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.180.0/three.module.js",
+                "three": "http://127.0.0.1:8090/vendor/js/three.module.js",
                 "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
-                "spark": "https://sparkjs.dev/releases/spark/preview/2.0.0/spark.module.js",
+                "spark": "http://127.0.0.1:8090/vendor/js/spark.module.js",
                 "lil-gui": "http://127.0.0.1:8090/vendor/js/lil-gui.esm.js"
               }
             };
@@ -1444,9 +1444,9 @@ def build_demo(examples_dir="./examples/worldrecon"):
         <script type="importmap">
         {
           "imports": {
-            "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.180.0/three.module.js",
+            "three": "http://127.0.0.1:8090/vendor/js/three.module.js",
             "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
-            "spark": "https://sparkjs.dev/releases/spark/preview/2.0.0/spark.module.js",
+            "spark": "http://127.0.0.1:8090/vendor/js/spark.module.js",
             "lil-gui": "http://127.0.0.1:8090/vendor/js/lil-gui.esm.js"
           }
         }
