@@ -1,0 +1,1 @@
+pip install -U torch==2.8.0 torchvision --index-url https://download.pytorch.org/whl/cu128
