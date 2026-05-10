@@ -7,3 +7,7 @@ gradio_demo_output/
 skyseg.onnx
 *.safetensors
 *.ckpt
+
+# Runtime generated files
+gradio_served/
+output_examples/

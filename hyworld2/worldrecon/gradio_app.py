@@ -109,7 +109,7 @@ def _mp_launch_fn(rank, pipeline_kwargs, examples_dir, host, port, share, mp_por
 
     if rank == 0:
         print(f"[Gradio] Rank 0 (mp.spawn): launching Gradio")
-        served_dir = Path.cwd() / "gradio_served"
+        served_dir = Path.cwd()
         served_dir.mkdir(parents=True, exist_ok=True)
         print(f"[Gradio] Static files directory: {served_dir}")
 
@@ -859,7 +859,7 @@ def _spark_js_callback():
                 "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.180.0/three.module.js",
                 "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
                 "spark": "https://sparkjs.dev/releases/spark/preview/2.0.0/spark.module.js",
-                "lil-gui": "http://127.0.0.1:8090/lil-gui.esm.js"
+                "lil-gui": "http://127.0.0.1:8090/vendor/js/lil-gui.esm.js"
               }
             };
             const im = document.createElement('script');
@@ -1240,8 +1240,7 @@ def _spark_js_callback():
                             url = splatFile;
                             // Rewrite gradio_served/ paths to use the static file server on port 8090
                             if (url.includes("gradio_served/")) {
-                                const filename = url.split("/").pop();
-                                url = "http://127.0.0.1:8090/" + filename;
+                                url = "http://127.0.0.1:8090/" + url;
                                 console.log("[Spark] Rewrote URL to static server:", url);
                             }
                             fileName = splatFile.split("/").pop().split("?")[0] || "downloaded-file";
@@ -1448,7 +1447,7 @@ def build_demo(examples_dir="./examples/worldrecon"):
             "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.180.0/three.module.js",
             "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
             "spark": "https://sparkjs.dev/releases/spark/preview/2.0.0/spark.module.js",
-            "lil-gui": "http://127.0.0.1:8090/lil-gui.esm.js"
+            "lil-gui": "http://127.0.0.1:8090/vendor/js/lil-gui.esm.js"
           }
         }
         </script>
@@ -1794,7 +1793,7 @@ if __name__ == "__main__":
 
         if rank == 0:
             print("[Gradio] Rank 0: launching Gradio server")
-            served_dir = Path.cwd() / "gradio_served"
+            served_dir = Path.cwd()
             served_dir.mkdir(parents=True, exist_ok=True)
             print(f"[Gradio] Static files directory: {served_dir}")
 
@@ -1860,7 +1859,7 @@ if __name__ == "__main__":
         import socketserver
 
         # Create gradio_served directory for static file serving
-        served_dir = Path.cwd() / "gradio_served"
+        served_dir = Path.cwd()
         served_dir.mkdir(parents=True, exist_ok=True)
         print(f"[Gradio] Static files directory: {served_dir}")
 
