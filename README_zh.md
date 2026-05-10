@@ -56,6 +56,10 @@ https://github.com/user-attachments/assets/b56f4750-25c9-48fb-83ff-d58526711463
   <img src="assets/spark/510b.gif" width="45%" alt="Spark 查看器演示 2">
 </p>
 
+<p align="center">
+  <img src="assets/spark/run.png" width="80%" alt="终端 — 静态服务器和 Gradio 启动">
+</p>
+
 | 面板 | 控制项 |
 |------|--------|
 | **Settings**（右侧） | 相机 6 自由度（XYZ + 旋转）、FOV、坐标系统（OpenCV/OpenGL/Z-up）、自动旋转、轨道控制、多级细节、模糊/AA 调试、背景颜色 |

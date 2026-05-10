@@ -53,6 +53,10 @@ The bundled **lil-gui** editor panels provide real-time control over every rende
   <img src="assets/spark/510b.gif" width="45%" alt="Spark Viewer demo 2">
 </p>
 
+<p align="center">
+  <img src="assets/spark/run.png" width="80%" alt="Terminal — static server and Gradio launch">
+</p>
+
 | Panel | Controls |
 |-------|----------|
 | **Settings** (right) | Camera 6-DoF (XYZ + rotate), FOV, coord system (OpenCV/OpenGL/Z-up), auto-rotate, orbit controls, Level-of-Detail, blur/AA debugging, background color |
